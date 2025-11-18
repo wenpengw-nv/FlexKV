@@ -16,7 +16,7 @@ GDSManager::GDSManager(std::map<int, std::vector<std::string>>& ssd_files,
     : is_ready_(false), num_devices_(num_devices), 
       round_robin_(round_robin)
 #ifdef ENABLE_GDS
-    , driver_initialized_(false), next_batch_id_(1)
+    , driver_initialized_(false), next_batch_id_(1), stop_workers_(false), num_worker_threads_(0)
 #endif
 {
     if (!initialize_driver()) {
@@ -30,6 +30,8 @@ GDSManager::GDSManager(std::map<int, std::vector<std::string>>& ssd_files,
         set_error("Failed to create shared CUDA stream");
         return;
     }
+    
+    initialize_worker_threads();
 #endif
     
     this->num_files_per_device_ = ssd_files[0].size();
@@ -49,6 +51,9 @@ GDSManager::GDSManager(std::map<int, std::vector<std::string>>& ssd_files,
 }
 
 GDSManager::~GDSManager() {
+#ifdef ENABLE_GDS
+    shutdown_worker_threads();
+#endif
     cleanup();
 }
 
@@ -261,6 +266,73 @@ cudaStream_t GDSManager::get_stream() const {
     return is_ready_ ? shared_stream_ : nullptr;
 }
 #endif
+
+void GDSManager::initialize_worker_threads() {
+#ifdef ENABLE_GDS
+    unsigned int hw_threads = std::thread::hardware_concurrency();
+    num_worker_threads_ = std::min(hw_threads > 0 ? hw_threads : 4, 8u);
+    
+    stop_workers_ = false;
+    worker_threads_.reserve(num_worker_threads_);
+    
+    for (int i = 0; i < num_worker_threads_; ++i) {
+        worker_threads_.emplace_back([this]() {
+            while (true) {
+                Task task;
+                {
+                    std::unique_lock<std::mutex> lock(queue_mutex_);
+                    queue_cv_.wait(lock, [this]{ 
+                        return stop_workers_ || !task_queue_.empty(); 
+                    });
+                    
+                    if (stop_workers_ && task_queue_.empty()) {
+                        return;
+                    }
+                    
+                    task = std::move(task_queue_.front());
+                    task_queue_.pop();
+                }
+                
+                task();
+            }
+        });
+    }
+#endif
+}
+
+void GDSManager::shutdown_worker_threads() {
+#ifdef ENABLE_GDS
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        stop_workers_ = true;
+    }
+    queue_cv_.notify_all();
+    
+    for (auto& thread : worker_threads_) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    worker_threads_.clear();
+#endif
+}
+
+std::future<void> GDSManager::enqueue_task(std::function<void()> task) {
+#ifdef ENABLE_GDS
+    auto pkg = std::make_shared<std::packaged_task<void()>>(std::move(task));
+    std::future<void> fut = pkg->get_future();
+    
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        task_queue_.emplace([pkg]() { (*pkg)(); });
+    }
+    queue_cv_.notify_one();
+    
+    return fut;
+#else
+    return std::future<void>();
+#endif
+}
 
 ssize_t GDSManager::write(const char* filename, const void* gpu_data, size_t size, size_t file_offset) {
     if (!is_ready_) {
@@ -627,6 +699,15 @@ void transfer_kv_blocks_gds(
         ssd_block_id_ptr, gpu_block_id_ptr, num_transfers, num_devices, round_robin,
         gpu_blocks_partition, ssd_blocks_partition);
     
+    int64_t gpu_layer_stride_in_bytes = gpu_tensor_handler.gpu_layer_stride * sizeof(int64_t);
+    int64_t gpu_block_stride_in_bytes = gpu_tensor_handler.gpu_block_stride * sizeof(int64_t);
+    
+    const bool gpu_is_block_first = gpu_block_stride_in_bytes >= gpu_layer_stride_in_bytes;
+    const bool ssd_is_block_first = ssd_block_stride_in_bytes >= ssd_layer_stride_in_bytes;
+    const bool enable_block_first_transfer = gpu_is_block_first && ssd_is_block_first;
+
+    std::vector<std::future<void>> transfer_futures;
+    
     // Process each device (like SSD transfer)
     for (int device_id = 0; device_id < num_devices; device_id++) {
         const std::vector<int>& gpu_blocks = gpu_blocks_partition[device_id];
@@ -634,44 +715,117 @@ void transfer_kv_blocks_gds(
         
         const std::vector<std::string>& file_list = gds_manager.get_file_paths(device_id);
         
+        // Submit task to the thread pool
         for (size_t j = 0; j < gpu_blocks.size(); j++) {
-            int64_t gpu_block_id = gpu_blocks[j];
-            int64_t ssd_block_id = ssd_blocks[j];
-            
-            int file_id_in_device = ssd_block_id % num_files_per_device;
-            const std::string& filename = file_list[file_id_in_device];
-            int64_t block_id_in_file = ssd_block_id / num_files_per_device;
-            
-            // Process each layer for this block
-            for (int i = 0; i < num_layers; i++) {
-                int32_t layer_idx = gpu_layer_id_list_ptr[i];
+            transfer_futures.push_back(gds_manager.enqueue_task([&, device_id, j]() {
+                int64_t gpu_block_id = gpu_blocks[j];
+                int64_t ssd_block_id = ssd_blocks[j];
                 
-                int64_t *gpu_k_ptr = ptr_at<Type>(gpu_tensor_handler, i, 0, gpu_block_id);
-                int64_t *gpu_v_ptr = is_mla ? nullptr : ptr_at<Type>(gpu_tensor_handler, i, 1, gpu_block_id);
+                int file_id_in_device = ssd_block_id % num_files_per_device;
+                const std::string& filename = file_list[file_id_in_device];
+                int64_t block_id_in_file = ssd_block_id / num_files_per_device;
                 
-                int64_t ssd_base_offset = 
-                    ssd_layer_stride_in_bytes * layer_idx +
-                    ssd_block_stride_in_bytes * block_id_in_file;
-                
-                int64_t ssd_k_offset = ssd_base_offset + ssd_copy_off_inside_chunks;
-                int64_t ssd_v_offset = ssd_k_offset + ssd_kv_stride_in_bytes;
-                
-                ssize_t k_result;
-                if (is_read) {
-                    // SSD -> GPU (read from SSD file to GPU memory)
-                    k_result = gds_manager.read(filename.c_str(), gpu_k_ptr, chunk_size_in_bytes, ssd_k_offset);
-                } else {
-                    // GPU -> SSD (write from GPU memory to SSD file) 
-                    k_result = gds_manager.write(filename.c_str(), gpu_k_ptr, chunk_size_in_bytes, ssd_k_offset);
+                // Block-first transfer
+                if (enable_block_first_transfer) {
+                    int32_t start_layer = gpu_layer_id_list_ptr[0];
+                    int64_t layers_chunk_size_in_bytes = gpu_layer_stride_in_bytes * num_layers;
+                    int64_t ssd_layers_chunk_offset = start_layer * ssd_layer_stride_in_bytes;
+                    
+                    int64_t *gpu_block_ptr = ptr_at<Type>(gpu_tensor_handler, 0, 0, gpu_block_id);
+                    
+                    int64_t ssd_block_offset = 
+                        ssd_block_stride_in_bytes * block_id_in_file + 
+                        ssd_layers_chunk_offset + 
+                        ssd_copy_off_inside_chunks;
+                    
+                    ssize_t transfer_result;
+                    if (is_read) {
+                        // SSD -> GPU
+                        transfer_result = gds_manager.read(filename.c_str(), gpu_block_ptr, 
+                                                          layers_chunk_size_in_bytes, ssd_block_offset);
+                    } else {
+                        // GPU -> SSD
+                        transfer_result = gds_manager.write(filename.c_str(), gpu_block_ptr, 
+                                                           layers_chunk_size_in_bytes, ssd_block_offset);
+                    }
+                    
+                    if (transfer_result != layers_chunk_size_in_bytes) {
+                        throw std::runtime_error("Failed to transfer block " + std::to_string(j) +
+                                               " (block-first mode), file " + filename + 
+                                               ", size=" + std::to_string(layers_chunk_size_in_bytes) +
+                                               ", offset=" + std::to_string(ssd_block_offset) +
+                                               ": " + gds_manager.get_last_error());
+                    }
+                    
+                    if (verbose) {
+                        std::cerr << "Block " << j << " (block-first)"
+                                  << " Operation: " << (is_read ? "Read" : "Write")
+                                  << " Device: " << device_id 
+                                  << " File_in_device: " << file_id_in_device
+                                  << " Block_in_file: " << block_id_in_file
+                                  << " GPU Block ID: " << gpu_block_id 
+                                  << " Layers: " << num_layers
+                                  << " Total bytes: " << transfer_result << std::endl;
+                    }
+                    
+                    return;
                 }
                 
-                if (k_result != chunk_size_in_bytes) {
-                    throw std::runtime_error("Failed to transfer K block for layer " + 
-                                           std::to_string(layer_idx) + ", block " + std::to_string(j) +
-                                           ", file " + filename + ": " + gds_manager.get_last_error());
-                }
-                
-                if (is_mla) {
+                // Layer-wise transfer
+                for (int i = 0; i < num_layers; i++) {
+                    int32_t layer_idx = gpu_layer_id_list_ptr[i];
+                    
+                    int64_t *gpu_k_ptr = ptr_at<Type>(gpu_tensor_handler, i, 0, gpu_block_id);
+                    int64_t *gpu_v_ptr = is_mla ? nullptr : ptr_at<Type>(gpu_tensor_handler, i, 1, gpu_block_id);
+                    
+                    int64_t ssd_base_offset = 
+                        ssd_layer_stride_in_bytes * layer_idx +
+                        ssd_block_stride_in_bytes * block_id_in_file;
+                    
+                    int64_t ssd_k_offset = ssd_base_offset + ssd_copy_off_inside_chunks;
+                    int64_t ssd_v_offset = ssd_k_offset + ssd_kv_stride_in_bytes;
+                    
+                    ssize_t k_result;
+                    if (is_read) {
+                        // SSD -> GPU (read from SSD file to GPU memory)
+                        k_result = gds_manager.read(filename.c_str(), gpu_k_ptr, chunk_size_in_bytes, ssd_k_offset);
+                    } else {
+                        // GPU -> SSD (write from GPU memory to SSD file) 
+                        k_result = gds_manager.write(filename.c_str(), gpu_k_ptr, chunk_size_in_bytes, ssd_k_offset);
+                    }
+                    
+                    if (k_result != chunk_size_in_bytes) {
+                        throw std::runtime_error("Failed to transfer K block for layer " + 
+                                               std::to_string(layer_idx) + ", block " + std::to_string(j) +
+                                               ", file " + filename + ": " + gds_manager.get_last_error());
+                    }
+                    
+                    if (is_mla) {
+                        if (verbose) {
+                            std::cerr << "Layer " << layer_idx << " Block " << j
+                                      << " Operation: " << (is_read ? "Read" : "Write")
+                                      << " Device: " << device_id 
+                                      << " File_in_device: " << file_id_in_device
+                                      << " Block_in_file: " << block_id_in_file
+                                      << " GPU Block ID: " << gpu_block_id 
+                                      << " K bytes: " << k_result << std::endl;
+                        }
+                        continue;
+                    }
+
+                    ssize_t v_result;
+                    if (is_read) {
+                        v_result = gds_manager.read(filename.c_str(), gpu_v_ptr, chunk_size_in_bytes, ssd_v_offset);
+                    } else {
+                        v_result = gds_manager.write(filename.c_str(), gpu_v_ptr, chunk_size_in_bytes, ssd_v_offset);
+                    }
+                    
+                    if (v_result != chunk_size_in_bytes) {
+                        throw std::runtime_error("Failed to transfer V block for layer " + 
+                                               std::to_string(layer_idx) + ", block " + std::to_string(j) +
+                                               ", file " + filename + ": " + gds_manager.get_last_error());
+                    }
+                    
                     if (verbose) {
                         std::cerr << "Layer " << layer_idx << " Block " << j
                                   << " Operation: " << (is_read ? "Read" : "Write")
@@ -679,38 +833,27 @@ void transfer_kv_blocks_gds(
                                   << " File_in_device: " << file_id_in_device
                                   << " Block_in_file: " << block_id_in_file
                                   << " GPU Block ID: " << gpu_block_id 
-                                  << " K bytes: " << k_result << std::endl;
+                                  << " K bytes: " << k_result
+                                  << " V bytes: " << v_result << std::endl;
                     }
-                    continue;
-                }
-
-                ssize_t v_result;
-                if (is_read) {
-                    v_result = gds_manager.read(filename.c_str(), gpu_v_ptr, chunk_size_in_bytes, ssd_v_offset);
-                } else {
-                    v_result = gds_manager.write(filename.c_str(), gpu_v_ptr, chunk_size_in_bytes, ssd_v_offset);
-                }
-                
-                if (v_result != chunk_size_in_bytes) {
-                    throw std::runtime_error("Failed to transfer V block for layer " + 
-                                           std::to_string(layer_idx) + ", block " + std::to_string(j) +
-                                           ", file " + filename + ": " + gds_manager.get_last_error());
-                }
-                
-                if (verbose) {
-                    std::cerr << "Layer " << layer_idx << " Block " << j
-                              << " Operation: " << (is_read ? "Read" : "Write")
-                              << " Device: " << device_id 
-                              << " File_in_device: " << file_id_in_device
-                              << " Block_in_file: " << block_id_in_file
-                              << " GPU Block ID: " << gpu_block_id 
-                              << " K bytes: " << k_result
-                              << " V bytes: " << v_result << std::endl;
-                }
-            } // end layer loop
+                } // end layer loop
+            })); // enqueue_task
         } // end block loop
     } // end device loop
     
+    for (auto& future : transfer_futures) {
+        try {
+            future.get();
+        } catch (const std::exception& e) {
+            for (auto& remaining_future : transfer_futures) {
+                try {
+                    remaining_future.wait();
+                } catch (...) {
+                }
+            }
+            throw;
+        }
+    }
     // Synchronize to ensure all operations complete
     gds_manager.synchronize();
 }
