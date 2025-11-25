@@ -1,4 +1,5 @@
 #include "gds_manager.h"
+#include "gds_layout_transform.cuh"
 
 #ifdef ENABLE_GDS
 #include <fcntl.h>
@@ -873,5 +874,280 @@ template void transfer_kv_blocks_gds<BackendType::SGLANG>(
     GDSManager&, const torch::Tensor&, GTensorHandler, const torch::Tensor&,
     const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
     int, int64_t, bool, bool, bool);
+
+/**
+ * Staged GDS transfer implementation
+ * 
+ * For non-TRTLLM backends (VLLM, SGLANG), this function:
+ * 1. Allocates a staging buffer with block-first layout (same as SSD)
+ * 2. For READ: GDS transfer SSD -> staging buffer, then CUDA kernel transform staging -> target GPU
+ * 3. For WRITE: CUDA kernel transform target GPU -> staging, then GDS transfer staging -> SSD
+ * 
+ * For TRTLLM backend, directly uses block-first transfer (no staging needed).
+ */
+template<BackendType Type>
+void transfer_kv_blocks_gds_staged(
+    GDSManager& gds_manager,
+    const torch::Tensor& gpu_layer_id_list,
+    GTensorHandler gpu_tensor_handler,
+    const torch::Tensor& ssd_block_ids,
+    const torch::Tensor& gpu_block_ids,
+    int64_t ssd_layer_stride_in_bytes,
+    int64_t ssd_block_stride_in_bytes,
+    int64_t ssd_kv_stride_in_bytes,
+    int64_t chunk_size_in_bytes,
+    int64_t ssd_copy_off_inside_chunks,
+    int num_blocks_per_file,
+    int64_t total_layers,
+    bool is_read,
+    void* staging_buffer,
+    bool verbose,
+    bool is_mla
+) {
+    if (!gds_manager.is_ready()) {
+        throw std::runtime_error("GDS Manager not ready: " + gds_manager.get_last_error());
+    }
+    
+    // For TRTLLM, GPU layout is already block-first, use direct transfer
+    if constexpr (Type == BackendType::TRTLLM) {
+        transfer_kv_blocks_gds<Type>(
+            gds_manager, gpu_layer_id_list, gpu_tensor_handler,
+            ssd_block_ids, gpu_block_ids,
+            ssd_layer_stride_in_bytes, ssd_block_stride_in_bytes, ssd_kv_stride_in_bytes,
+            chunk_size_in_bytes, ssd_copy_off_inside_chunks,
+            num_blocks_per_file, total_layers, is_read, verbose, is_mla);
+        return;
+    }
+    
+    // For VLLM/SGLANG, use staging buffer approach
+    int num_devices = gds_manager.get_num_devices();
+    int num_files_per_device = gds_manager.get_num_files_per_device();
+    int round_robin = gds_manager.get_round_robin();
+    
+    const int64_t* ssd_block_id_ptr = ssd_block_ids.data_ptr<int64_t>();
+    const int64_t* gpu_block_id_ptr = gpu_block_ids.data_ptr<int64_t>();
+    
+    const int num_layers = gpu_layer_id_list.size(0);
+    const int32_t* gpu_layer_id_list_ptr = gpu_layer_id_list.data_ptr<int32_t>();
+    const int num_transfers = ssd_block_ids.size(0);
+    
+    if (num_transfers == 0) return;
+    
+    // Calculate staging buffer size (block-first layout)
+    // Staging layout matches SSD: [block][layer][kv][data]
+    int kv_dim = is_mla ? 1 : 2;
+    int64_t staging_layer_stride_in_bytes = chunk_size_in_bytes * kv_dim;
+    int64_t staging_block_stride_in_bytes = staging_layer_stride_in_bytes * num_layers;
+    int64_t staging_kv_stride_in_bytes = chunk_size_in_bytes;
+    int64_t total_staging_size = staging_block_stride_in_bytes * num_transfers;
+    
+    // Allocate or use provided staging buffer
+    void* staging_ptr = staging_buffer;
+    bool own_staging_buffer = false;
+    
+    if (!staging_ptr) {
+#ifdef ENABLE_GDS
+        cudaError_t cuda_status = cudaMalloc(&staging_ptr, total_staging_size);
+        if (cuda_status != cudaSuccess) {
+            throw std::runtime_error("Failed to allocate staging buffer: " + 
+                                    std::string(cudaGetErrorString(cuda_status)));
+        }
+        own_staging_buffer = true;
+#else
+        throw std::runtime_error("GDS not available");
+#endif
+    }
+    
+#ifdef ENABLE_GDS
+    // Get CUDA stream for layout transform
+    cudaStream_t transform_stream = gds_manager.get_stream();
+    
+    // Convert strides to int64_t units for kernel
+    int64_t staging_layer_stride = staging_layer_stride_in_bytes / sizeof(int64_t);
+    int64_t staging_kv_stride = staging_kv_stride_in_bytes / sizeof(int64_t);
+    int64_t staging_block_stride = staging_block_stride_in_bytes / sizeof(int64_t);
+    int64_t chunk_size = chunk_size_in_bytes / sizeof(int64_t);
+    
+    // Partition blocks by device
+    std::vector<std::vector<int>> gpu_blocks_partition(num_devices);
+    std::vector<std::vector<int>> ssd_blocks_partition(num_devices);
+    std::vector<std::vector<int>> staging_idx_partition(num_devices);  // Index in staging buffer
+    
+    for (int i = 0; i < num_transfers; i++) {
+        int64_t ssd_block_id = ssd_block_id_ptr[i];
+        int64_t gpu_block_id = gpu_block_id_ptr[i];
+        int device_id = (ssd_block_id / round_robin) % num_devices;
+        int block_id_in_device =
+            ((ssd_block_id / round_robin) / num_devices) * round_robin +
+            (ssd_block_id % round_robin);
+        ssd_blocks_partition[device_id].push_back(block_id_in_device);
+        gpu_blocks_partition[device_id].push_back(gpu_block_id);
+        staging_idx_partition[device_id].push_back(i);
+    }
+    
+    // For WRITE operation: first transform GPU -> staging
+    if (!is_read) {
+        // Prepare gpu_block_ids on device for kernel
+        int64_t* d_gpu_block_ids;
+        cudaMalloc(&d_gpu_block_ids, num_transfers * sizeof(int64_t));
+        cudaMemcpy(d_gpu_block_ids, gpu_block_id_ptr, num_transfers * sizeof(int64_t), 
+                   cudaMemcpyHostToDevice);
+        
+        // Transform from target GPU tensor to staging buffer
+        launch_layout_transform_kernel<Type>(
+            reinterpret_cast<int64_t*>(staging_ptr),
+            staging_layer_stride,
+            staging_kv_stride,
+            staging_block_stride,
+            chunk_size,
+            gpu_tensor_handler,
+            d_gpu_block_ids,
+            num_transfers,
+            num_layers,
+            is_mla,
+            false,  // staging_to_target = false (GPU -> staging)
+            transform_stream
+        );
+        
+        cudaStreamSynchronize(transform_stream);
+        cudaFree(d_gpu_block_ids);
+    }
+    
+    // GDS transfer: staging <-> SSD (block-first, highly efficient)
+    std::vector<std::future<void>> transfer_futures;
+    
+    for (int device_id = 0; device_id < num_devices; device_id++) {
+        const std::vector<int>& gpu_blocks = gpu_blocks_partition[device_id];
+        const std::vector<int>& ssd_blocks = ssd_blocks_partition[device_id];
+        const std::vector<int>& staging_indices = staging_idx_partition[device_id];
+        
+        const std::vector<std::string>& file_list = gds_manager.get_file_paths(device_id);
+        
+        for (size_t j = 0; j < ssd_blocks.size(); j++) {
+            transfer_futures.push_back(gds_manager.enqueue_task([&, device_id, j, 
+                                        staging_ptr, staging_block_stride_in_bytes,
+                                        ssd_copy_off_inside_chunks]() {
+                int staging_idx = staging_indices[j];
+                int64_t ssd_block_id = ssd_blocks[j];
+                
+                int file_id_in_device = ssd_block_id % num_files_per_device;
+                const std::string& filename = file_list[file_id_in_device];
+                int64_t block_id_in_file = ssd_block_id / num_files_per_device;
+                
+                // Calculate pointers
+                int32_t start_layer = gpu_layer_id_list_ptr[0];
+                int64_t layers_chunk_size_in_bytes = staging_block_stride_in_bytes;
+                
+                char* staging_block_ptr = reinterpret_cast<char*>(staging_ptr) + 
+                                         staging_idx * staging_block_stride_in_bytes;
+                
+                int64_t ssd_block_offset = 
+                    ssd_block_stride_in_bytes * block_id_in_file + 
+                    start_layer * ssd_layer_stride_in_bytes +
+                    ssd_copy_off_inside_chunks;
+                
+                ssize_t transfer_result;
+                if (is_read) {
+                    transfer_result = gds_manager.read(filename.c_str(), staging_block_ptr,
+                                                      layers_chunk_size_in_bytes, ssd_block_offset);
+                } else {
+                    transfer_result = gds_manager.write(filename.c_str(), staging_block_ptr,
+                                                       layers_chunk_size_in_bytes, ssd_block_offset);
+                }
+                
+                if (transfer_result != layers_chunk_size_in_bytes) {
+                    throw std::runtime_error("GDS transfer failed for block " + std::to_string(j) +
+                                           ", file " + filename + 
+                                           ", expected=" + std::to_string(layers_chunk_size_in_bytes) +
+                                           ", got=" + std::to_string(transfer_result) +
+                                           ": " + gds_manager.get_last_error());
+                }
+                
+                if (verbose) {
+                    std::cerr << "Staged transfer - Block " << j 
+                              << " Operation: " << (is_read ? "Read" : "Write")
+                              << " Device: " << device_id
+                              << " File_in_device: " << file_id_in_device
+                              << " Block_in_file: " << block_id_in_file
+                              << " Staging_idx: " << staging_idx
+                              << " Total bytes: " << transfer_result << std::endl;
+                }
+            }));
+        }
+    }
+    
+    // Wait for all GDS transfers to complete
+    for (auto& future : transfer_futures) {
+        try {
+            future.get();
+        } catch (const std::exception& e) {
+            for (auto& remaining_future : transfer_futures) {
+                try {
+                    remaining_future.wait();
+                } catch (...) {}
+            }
+            if (own_staging_buffer) {
+                cudaFree(staging_ptr);
+            }
+            throw;
+        }
+    }
+    
+    // For READ operation: transform staging -> GPU
+    if (is_read) {
+        // Prepare gpu_block_ids on device for kernel
+        int64_t* d_gpu_block_ids;
+        cudaMalloc(&d_gpu_block_ids, num_transfers * sizeof(int64_t));
+        cudaMemcpy(d_gpu_block_ids, gpu_block_id_ptr, num_transfers * sizeof(int64_t), 
+                   cudaMemcpyHostToDevice);
+        
+        // Transform from staging buffer to target GPU tensor
+        launch_layout_transform_kernel<Type>(
+            reinterpret_cast<int64_t*>(staging_ptr),
+            staging_layer_stride,
+            staging_kv_stride,
+            staging_block_stride,
+            chunk_size,
+            gpu_tensor_handler,
+            d_gpu_block_ids,
+            num_transfers,
+            num_layers,
+            is_mla,
+            true,  // staging_to_target = true (staging -> GPU)
+            transform_stream
+        );
+        
+        cudaStreamSynchronize(transform_stream);
+        cudaFree(d_gpu_block_ids);
+    }
+    
+    // Cleanup
+    if (own_staging_buffer) {
+        cudaFree(staging_ptr);
+    }
+    
+    gds_manager.synchronize();
+#else
+    (void)staging_ptr;
+    (void)own_staging_buffer;
+    throw std::runtime_error("GDS not available");
+#endif
+}
+
+// Explicit template instantiations for staged transfer
+template void transfer_kv_blocks_gds_staged<BackendType::VLLM>(
+    GDSManager&, const torch::Tensor&, GTensorHandler, const torch::Tensor&,
+    const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
+    int, int64_t, bool, void*, bool, bool);
+
+template void transfer_kv_blocks_gds_staged<BackendType::TRTLLM>(
+    GDSManager&, const torch::Tensor&, GTensorHandler, const torch::Tensor&,
+    const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
+    int, int64_t, bool, void*, bool, bool);
+
+template void transfer_kv_blocks_gds_staged<BackendType::SGLANG>(
+    GDSManager&, const torch::Tensor&, GTensorHandler, const torch::Tensor&,
+    const torch::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t,
+    int, int64_t, bool, void*, bool, bool);
 
 }

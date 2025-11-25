@@ -225,6 +225,99 @@ void transfer_kv_blocks_gds_binding(
     }
 }
 
+/**
+ * Staged GDS transfer binding for VLLM/SGLANG backends
+ * 
+ * This function provides optimized GDS transfer by using a staging buffer:
+ * 1. GDS transfers data in block-first layout to/from staging buffer
+ * 2. CUDA kernel transforms layout between staging buffer and target GPU tensor
+ * 
+ * This approach enables block-first GDS optimization for non-TRTLLM backends.
+ */
+void transfer_kv_blocks_gds_staged_binding(
+    GDSManager& gds_manager,
+    const torch::Tensor& gpu_layer_id_list,
+    const torch::Tensor& gpu_layer_ptrs_tensor,
+    const torch::Tensor& gds_block_ids,
+    const torch::Tensor& gpu_block_ids,
+    int64_t gpu_kv_stride_in_bytes,
+    int64_t gpu_block_stride_in_bytes,
+    int64_t gpu_layer_stride_in_bytes,
+    int64_t gds_layer_stride_in_bytes,
+    int64_t gds_block_stride_in_bytes,
+    int64_t gds_kv_stride_in_bytes,
+    int64_t block_size_in_bytes,
+    int64_t gds_copy_off_inside_chunks,
+    int num_blocks_per_file,
+    int64_t total_layers,
+    bool is_read,
+    bool verbose = false,
+    bool is_mla = false,
+    int gpu_block_type = 0,
+    c10::optional<torch::Tensor> staging_buffer = c10::nullopt
+) {
+    TORCH_CHECK(gpu_layer_ptrs_tensor.dtype() == torch::kInt64,
+                "gpu_layer_ptrs must be int64");
+    TORCH_CHECK(gds_block_ids.dtype() == torch::kInt64,
+                "gds_block_ids must be int64");
+    TORCH_CHECK(gpu_block_ids.dtype() == torch::kInt64,
+                "gpu_block_ids must be int64");
+    TORCH_CHECK(gpu_layer_id_list.dtype() == torch::kInt32,
+                "gpu_layer_id_list must be int32");
+    
+    flexkv::BackendType backend_type;
+    if (gpu_block_type == 0) {
+        backend_type = flexkv::BackendType::VLLM;
+    } else if (gpu_block_type == 1) {
+        backend_type = flexkv::BackendType::TRTLLM;
+    } else if (gpu_block_type == 2) {
+        backend_type = flexkv::BackendType::SGLANG;
+    } else {
+        throw std::runtime_error("Unsupported gpu_block_type: " + std::to_string(gpu_block_type));
+    }
+    
+    // Create GTensorHandler
+    void **gpu_tensor_ptrs = static_cast<void **>(gpu_layer_ptrs_tensor.data_ptr());
+    flexkv::GTensorHandler handler(
+        backend_type,
+        reinterpret_cast<int64_t**>(gpu_tensor_ptrs),
+        total_layers,
+        gpu_kv_stride_in_bytes,
+        gpu_block_stride_in_bytes,
+        gpu_layer_stride_in_bytes
+    );
+    
+    // Get staging buffer pointer if provided
+    void* staging_ptr = nullptr;
+    if (staging_buffer.has_value()) {
+        staging_ptr = staging_buffer.value().data_ptr();
+    }
+    
+    switch (backend_type) {
+        case flexkv::BackendType::VLLM:
+            flexkv::transfer_kv_blocks_gds_staged<flexkv::BackendType::VLLM>(
+                gds_manager, gpu_layer_id_list, handler, gds_block_ids, gpu_block_ids,
+                gds_layer_stride_in_bytes, gds_block_stride_in_bytes, gds_kv_stride_in_bytes,
+                block_size_in_bytes, gds_copy_off_inside_chunks, num_blocks_per_file,
+                total_layers, is_read, staging_ptr, verbose, is_mla);
+            break;
+        case flexkv::BackendType::TRTLLM:
+            flexkv::transfer_kv_blocks_gds_staged<flexkv::BackendType::TRTLLM>(
+                gds_manager, gpu_layer_id_list, handler, gds_block_ids, gpu_block_ids,
+                gds_layer_stride_in_bytes, gds_block_stride_in_bytes, gds_kv_stride_in_bytes,
+                block_size_in_bytes, gds_copy_off_inside_chunks, num_blocks_per_file,
+                total_layers, is_read, staging_ptr, verbose, is_mla);
+            break;
+        case flexkv::BackendType::SGLANG:
+            flexkv::transfer_kv_blocks_gds_staged<flexkv::BackendType::SGLANG>(
+                gds_manager, gpu_layer_id_list, handler, gds_block_ids, gpu_block_ids,
+                gds_layer_stride_in_bytes, gds_block_stride_in_bytes, gds_kv_stride_in_bytes,
+                block_size_in_bytes, gds_copy_off_inside_chunks, num_blocks_per_file,
+                total_layers, is_read, staging_ptr, verbose, is_mla);
+            break;
+    }
+}
+
 // GDS Manager Python bindings
 py::list gds_batch_write_binding(GDSManager& manager, 
                                  py::list operations_list) {
@@ -383,6 +476,21 @@ PYBIND11_MODULE(c_ext, m) {
         py::arg("num_blocks_per_file"), py::arg("total_layers"), 
         py::arg("is_read"), py::arg("verbose") = false, py::arg("is_mla") = false,
         py::arg("gpu_block_type") = 0);
+  m.def("transfer_kv_blocks_gds_staged", &transfer_kv_blocks_gds_staged_binding,
+        "Transfer KV blocks between GPU and GDS storage with staging buffer optimization.\n"
+        "This function uses a staging buffer to enable block-first GDS transfer for non-TRTLLM backends.\n"
+        "For TRTLLM backend, it behaves the same as transfer_kv_blocks_gds.",
+        py::arg("gds_manager"),
+        py::arg("gpu_layer_id_list"), py::arg("gpu_layer_ptrs_tensor"),
+        py::arg("gds_block_ids"), py::arg("gpu_block_ids"),
+        py::arg("gpu_kv_stride_in_bytes"), py::arg("gpu_block_stride_in_bytes"),
+        py::arg("gpu_layer_stride_in_bytes"),
+        py::arg("gds_layer_stride_in_bytes"), py::arg("gds_block_stride_in_bytes"),
+        py::arg("gds_kv_stride_in_bytes"), py::arg("block_size_in_bytes"),
+        py::arg("gds_copy_off_inside_chunks"),
+        py::arg("num_blocks_per_file"), py::arg("total_layers"), 
+        py::arg("is_read"), py::arg("verbose") = false, py::arg("is_mla") = false,
+        py::arg("gpu_block_type") = 0, py::arg("staging_buffer") = py::none());
   m.def("get_hash_size", &flexkv::get_hash_size,
         "Get the size of the hash result");
   m.def("gen_hashes", &flexkv::gen_hashes, "Generate hashes for a tensor",

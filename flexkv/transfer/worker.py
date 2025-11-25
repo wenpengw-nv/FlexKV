@@ -17,7 +17,8 @@ import torch
 from flexkv import c_ext
 
 from flexkv.c_ext import transfer_kv_blocks, transfer_kv_blocks_ssd, \
-    transfer_kv_blocks_gds, TPTransferThreadGroup, TPGDSTransferThreadGroup
+    transfer_kv_blocks_gds, transfer_kv_blocks_gds_staged, \
+    TPTransferThreadGroup, TPGDSTransferThreadGroup
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -858,6 +859,8 @@ class GDSTransferWorker(TransferWorkerBase):
         ssd_kv_layout: KVCacheLayout,
         dtype: torch.dtype,
         gpu_device_id: int = 0,
+        use_staged_transfer: Optional[bool] = None,
+        max_staging_blocks: Optional[int] = None,
     ) -> None:
         """
         Initialize GDS Transfer Worker
@@ -873,6 +876,8 @@ class GDSTransferWorker(TransferWorkerBase):
             ssd_kv_layout: Layout of SSD KV cache
             dtype: Data type
             gpu_device_id: GPU device ID
+            use_staged_transfer: Use staged transfer for VLLM/SGLANG backends (block-first GDS + layout transform)
+            max_staging_blocks: Maximum number of blocks to hold in staging buffer
         """
         # Initialize base class first
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
@@ -924,6 +929,31 @@ class GDSTransferWorker(TransferWorkerBase):
             self.gpu_block_type_ = 2  # SGLANG
         else:
             raise ValueError(f"Invalid GPU block type: {len(self.gpu_blocks)}")
+        
+        # Staged transfer configuration from environment or parameters
+        # Only use staged transfer for non-TRTLLM backends (VLLM, SGLANG)
+        # TRTLLM already has block-first layout, no staging needed
+        if use_staged_transfer is None:
+            use_staged_transfer = GLOBAL_CONFIG_FROM_ENV.gds_use_staged_transfer
+        if max_staging_blocks is None:
+            max_staging_blocks = GLOBAL_CONFIG_FROM_ENV.gds_max_staging_blocks
+            
+        self.use_staged_transfer = use_staged_transfer and (self.gpu_block_type_ != 1)
+        self.staging_buffer = None
+        self.max_staging_blocks = max_staging_blocks
+        
+        if self.use_staged_transfer:
+            # Pre-allocate staging buffer for better performance
+            # Staging buffer layout: [block][layer][kv][data] (block-first, same as SSD)
+            kv_dim = 1 if self.is_mla else 2
+            staging_block_size = self.chunk_size_in_bytes * kv_dim * self.num_layers
+            staging_total_size = staging_block_size * max_staging_blocks
+            # Allocate as uint8 tensor to match byte size
+            self.staging_buffer = torch.empty(
+                staging_total_size, dtype=torch.uint8, device=f"cuda:{gpu_device_id}"
+            )
+            flexkv_logger.info(f"GDSTransferWorker {worker_id}: Allocated staging buffer "
+                              f"({staging_total_size / 1024 / 1024:.2f} MB) for {max_staging_blocks} blocks")
 
         # Set GPU device and create stream
         self.gpu_device_id = gpu_device_id
@@ -975,27 +1005,57 @@ class GDSTransferWorker(TransferWorkerBase):
         # Use the optimized C++ function for KV block transfers
         # Note: topology information (files, devices, round_robin) is now encapsulated in gds_manager
         try:
-            transfer_kv_blocks_gds(
-                self.gds_manager,               # GDS manager (contains topology info)
-                layer_id_list,                  # GPU layer IDs to process
-                self.gpu_layer_ptrs,            # GPU layer pointers tensor
-                ssd_block_id_list,              # SSD block IDs
-                gpu_block_id_list,              # GPU block IDs
-                self.gpu_kv_stride_in_bytes,    # GPU K-V stride
-                self.gpu_block_stride_in_bytes, # GPU block stride
-                self.gpu_layer_stride_in_bytes, # GPU layer stride
-                self.ssd_layer_stride_in_bytes, # SSD layer stride
-                self.ssd_block_stride_in_bytes, # SSD block stride
-                self.ssd_kv_stride_in_bytes,    # SSD K-V stride
-                self.chunk_size_in_bytes,       # Chunk size
-                0,                              # SSD copy offset
-                self.num_blocks_per_file,       # Blocks per file
-                self.num_layers,                # Total layers
-                is_read,                        # Read or write
-                False,                          # Verbose logging
-                self.is_mla,                    # MLA
-                self.gpu_block_type_            # GPU block type
-            )
+            if self.use_staged_transfer:
+                # Use staged transfer for VLLM/SGLANG (block-first GDS + layout transform)
+                # This enables block-first optimization for non-TRTLLM backends
+                num_blocks = len(ssd_block_id_list)
+                staging_buf = self.staging_buffer if num_blocks <= self.max_staging_blocks else None
+                
+                transfer_kv_blocks_gds_staged(
+                    self.gds_manager,               # GDS manager (contains topology info)
+                    layer_id_list,                  # GPU layer IDs to process
+                    self.gpu_layer_ptrs,            # GPU layer pointers tensor
+                    ssd_block_id_list,              # SSD block IDs
+                    gpu_block_id_list,              # GPU block IDs
+                    self.gpu_kv_stride_in_bytes,    # GPU K-V stride
+                    self.gpu_block_stride_in_bytes, # GPU block stride
+                    self.gpu_layer_stride_in_bytes, # GPU layer stride
+                    self.ssd_layer_stride_in_bytes, # SSD layer stride
+                    self.ssd_block_stride_in_bytes, # SSD block stride
+                    self.ssd_kv_stride_in_bytes,    # SSD K-V stride
+                    self.chunk_size_in_bytes,       # Chunk size
+                    0,                              # SSD copy offset
+                    self.num_blocks_per_file,       # Blocks per file
+                    self.num_layers,                # Total layers
+                    is_read,                        # Read or write
+                    False,                          # Verbose logging
+                    self.is_mla,                    # MLA
+                    self.gpu_block_type_,           # GPU block type
+                    staging_buf                     # Pre-allocated staging buffer
+                )
+            else:
+                # Use direct transfer (for TRTLLM or when staged transfer is disabled)
+                transfer_kv_blocks_gds(
+                    self.gds_manager,               # GDS manager (contains topology info)
+                    layer_id_list,                  # GPU layer IDs to process
+                    self.gpu_layer_ptrs,            # GPU layer pointers tensor
+                    ssd_block_id_list,              # SSD block IDs
+                    gpu_block_id_list,              # GPU block IDs
+                    self.gpu_kv_stride_in_bytes,    # GPU K-V stride
+                    self.gpu_block_stride_in_bytes, # GPU block stride
+                    self.gpu_layer_stride_in_bytes, # GPU layer stride
+                    self.ssd_layer_stride_in_bytes, # SSD layer stride
+                    self.ssd_block_stride_in_bytes, # SSD block stride
+                    self.ssd_kv_stride_in_bytes,    # SSD K-V stride
+                    self.chunk_size_in_bytes,       # Chunk size
+                    0,                              # SSD copy offset
+                    self.num_blocks_per_file,       # Blocks per file
+                    self.num_layers,                # Total layers
+                    is_read,                        # Read or write
+                    False,                          # Verbose logging
+                    self.is_mla,                    # MLA
+                    self.gpu_block_type_            # GPU block type
+                )
 
         except Exception as e:
             flexkv_logger.error(f"GDS transfer failed: {e}")

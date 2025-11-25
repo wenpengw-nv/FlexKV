@@ -65,6 +65,11 @@ GLOBAL_CONFIG_FROM_ENV: Namespace = Namespace(
     use_ce_transfer_d2h=bool(int(os.getenv('FLEXKV_USE_CE_TRANSFER_D2H', 0))),
     transfer_sms_h2d=int(os.getenv('FLEXKV_TRANSFER_SMS_H2D', 8)),
     transfer_sms_d2h=int(os.getenv('FLEXKV_TRANSFER_SMS_D2H', 8)),
+    
+    # GDS staged transfer settings (for VLLM/SGLANG backends)
+    # Staged transfer enables block-first GDS optimization for non-TRTLLM backends
+    gds_use_staged_transfer=bool(int(os.getenv('FLEXKV_GDS_USE_STAGED_TRANSFER', 1))),
+    gds_max_staging_blocks=int(os.getenv('FLEXKV_GDS_MAX_STAGING_BLOCKS', 64)),
 
     iouring_entries=int(os.getenv('FLEXKV_IORING_ENTRIES', 512)),
     iouring_flags=int(os.getenv('FLEXKV_IORING_FLAGS', 0)),

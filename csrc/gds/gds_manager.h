@@ -349,4 +349,52 @@ void transfer_kv_blocks_gds(
     bool is_mla = false
 );
 
+/**
+ * High-level transfer function with staging buffer support for non-TRTLLM backends
+ * 
+ * This function provides optimized transfer for VLLM and SGLANG backends by:
+ * 1. Using GDS to transfer data in block-first layout to/from a staging buffer
+ * 2. Using CUDA kernel to transform layout between staging buffer and target GPU tensor
+ * 
+ * For TRTLLM backend, this function behaves the same as transfer_kv_blocks_gds
+ * since TRTLLM already uses block-first layout.
+ * 
+ * @tparam Type Backend type (VLLM, TRTLLM, or SGLANG)
+ * @param gds_manager GDS manager instance
+ * @param gpu_layer_id_list Tensor of layer IDs to process
+ * @param gpu_tensor_handler GTensorHandler for GPU memory layout
+ * @param ssd_block_ids Tensor of SSD block IDs
+ * @param gpu_block_ids Tensor of GPU block IDs
+ * @param ssd_layer_stride_in_bytes Stride between layers in SSD file
+ * @param ssd_block_stride_in_bytes Stride between blocks in SSD file  
+ * @param ssd_kv_stride_in_bytes Stride between K and V in SSD file
+ * @param chunk_size_in_bytes Size of each chunk in bytes
+ * @param ssd_copy_off_inside_chunks Copy offset inside each chunk in SSD file
+ * @param num_blocks_per_file Number of blocks per file
+ * @param total_layers Total number of layers
+ * @param is_read true for SSD->GPU, false for GPU->SSD
+ * @param staging_buffer Optional pre-allocated staging buffer (nullptr to allocate internally)
+ * @param verbose Enable verbose logging
+ * @param is_mla Whether using MLA
+ */
+template<BackendType Type>
+void transfer_kv_blocks_gds_staged(
+    GDSManager& gds_manager,
+    const torch::Tensor& gpu_layer_id_list,
+    GTensorHandler gpu_tensor_handler,
+    const torch::Tensor& ssd_block_ids,
+    const torch::Tensor& gpu_block_ids,
+    int64_t ssd_layer_stride_in_bytes,
+    int64_t ssd_block_stride_in_bytes,
+    int64_t ssd_kv_stride_in_bytes,
+    int64_t chunk_size_in_bytes,
+    int64_t ssd_copy_off_inside_chunks,
+    int num_blocks_per_file,
+    int64_t total_layers,
+    bool is_read,
+    void* staging_buffer = nullptr,
+    bool verbose = false,
+    bool is_mla = false
+);
+
 } // namespace flexkv 
