@@ -13,7 +13,7 @@ TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 MODEL_PATH="${MODEL_PATH:-/raid/model/gemma-3-4b-novision}"
 SERVE_PORT="${SERVE_PORT:-6000}"
-TRACE_FILE="${TRACE_FILE:-${SCRIPT_DIR}/trace_hashids_gpu1_qps300_isl160_osl1_0.5h.jsonl}"
+TRACE_FILE="${TRACE_FILE:-${SCRIPT_DIR}/trace_hashids_gpu1_qps120_isl160_osl1_0.5h.jsonl}"
 
 # aiperf goodput SLOs (平响100ms, p999=160ms)
 GOODPUT_SLOS="${GOODPUT_SLOS:-time_to_first_token:160}"
@@ -41,7 +41,7 @@ command -v aiperf > /dev/null || die "aiperf not found. Run: pip install aiperf"
 
 # ======================== Wait for Server Ready ========================
 
-log "[1/3] Checking server readiness..."
+log "[1/4] Checking server readiness..."
 
 MAX_WAIT=300
 INTERVAL=5
@@ -63,7 +63,7 @@ fi
 
 # ======================== Sanity Check ========================
 
-log "[2/3] Sending sanity check request..."
+log "[2/4] Sending sanity check request..."
 
 SANITY_RESP=$(curl -sf "http://localhost:${SERVE_PORT}/v1/completions" \
     -H "Content-Type: application/json" \
@@ -76,9 +76,23 @@ else
     log "  Response: ${SANITY_RESP:0:200}"
 fi
 
+# ======================== TCP Tuning (avoid port exhaustion) ========================
+
+log "[3/3] Tuning TCP for high-QPS localhost benchmark..."
+
+# server + client share the same port pool on localhost; widen it
+sysctl -w net.ipv4.ip_local_port_range="1024 65535"  > /dev/null 2>&1 || true
+sysctl -w net.ipv4.tcp_fin_timeout=10                 > /dev/null 2>&1 || true
+sysctl -w net.ipv4.tcp_tw_reuse=1                     > /dev/null 2>&1 || true
+sysctl -w net.core.somaxconn=65535                     > /dev/null 2>&1 || true
+
+log "  ip_local_port_range = $(cat /proc/sys/net/ipv4/ip_local_port_range)"
+log "  tcp_fin_timeout     = $(cat /proc/sys/net/ipv4/tcp_fin_timeout)"
+log "  tcp_tw_reuse        = $(cat /proc/sys/net/ipv4/tcp_tw_reuse)"
+
 # ======================== Run aiperf ========================
 
-log "[3/3] Running aiperf benchmark..."
+log "[4/4] Running aiperf benchmark..."
 mkdir -p "$RESULT_DIR"
 
 aiperf profile \

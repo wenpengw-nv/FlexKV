@@ -541,7 +541,7 @@ def main():
     )
     parser.add_argument(
         "--output_path", type=str,
-        default="/raid/wenpengw/myworkspace/FlexKV/temutest",
+        default="/raid/wenpengw/code/FlexKV/temutest",
         help="输出文件目录",
     )
     parser.add_argument(

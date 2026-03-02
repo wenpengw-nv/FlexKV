@@ -63,13 +63,15 @@ EOF
 
 cat > "${CONFIG_DIR}/extra-llm-api-config.yml" <<EOF
 enable_chunked_prefill: false
+cuda_graph_config:
+  enable_padding: true
 kv_cache_config:
   enable_partial_reuse: false
-  free_gpu_memory_fraction: 0.90
-# kv_connector_config:
-#   connector_module: "flexkv.integration.tensorrt_llm.trtllm_adapter"
-#   connector_scheduler_class: "FlexKVSchedulerConnector"
-#   connector_worker_class: "FlexKVWorkerConnector"
+  free_gpu_memory_fraction: 0.10
+kv_connector_config:
+  connector_module: "flexkv.integration.tensorrt_llm.trtllm_adapter"
+  connector_scheduler_class: "FlexKVSchedulerConnector"
+  connector_worker_class: "FlexKVWorkerConnector"
 print_iter_log: false
 EOF
 
@@ -80,14 +82,15 @@ log "  ${CONFIG_DIR}/extra-llm-api-config.yml"
 
 log "[2/3] Setting environment variables..."
 
-export TENSORRT_LLM_USE_FLEXKV=0
+export TENSORRT_LLM_USE_FLEXKV=1
 export FLEXKV_CONFIG_PATH="${CONFIG_DIR}/flexkv_config.yml"
 export FLEXKV_LOG_LEVEL="${FLEXKV_LOG_LEVEL:-INFO}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
 # monitor metrics
-export FLEXKV_ENABLE_METRICS=0
-export FLEXKV_PY_METRICS_PORT=8080
+export FLEXKV_ENABLE_METRICS=1
+export FLEXKV_PY_METRICS_PORT=8180
+export FLEXKV_CPP_METRICS_PORT=8181
 
 log "  TENSORRT_LLM_USE_FLEXKV=${TENSORRT_LLM_USE_FLEXKV}"
 log "  FLEXKV_CONFIG_PATH=${FLEXKV_CONFIG_PATH}"
@@ -95,6 +98,7 @@ log "  FLEXKV_LOG_LEVEL=${FLEXKV_LOG_LEVEL}"
 log "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 log "  FLEXKV_ENABLE_METRICS=${FLEXKV_ENABLE_METRICS}"
 log "  FLEXKV_PY_METRICS_PORT=${FLEXKV_PY_METRICS_PORT}"
+log "  FLEXKV_CPP_METRICS_PORT=${FLEXKV_CPP_METRICS_PORT}"
 
 # ======================== Kill Existing Server ========================
 
@@ -119,4 +123,4 @@ trtllm-serve "${MODEL_PATH}" \
     --max_seq_len "${MAX_SEQ_LEN}" \
     --max_num_tokens "${MAX_NUM_TOKENS}" \
     --max_batch_size "${MAX_BATCH_SIZE}" \
-    --extra_llm_api_options "${CONFIG_DIR}/extra-llm-api-config.yml" 2>&1 | tee "${SCRIPT_DIR}/server.log"
+    --extra_llm_api_options "${CONFIG_DIR}/extra-llm-api-config.yml" 2>&1 | tee "${SCRIPT_DIR}/log/server.log"
