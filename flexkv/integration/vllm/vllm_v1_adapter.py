@@ -303,6 +303,26 @@ class FlexKVSchedulerConnector:
 
         return namespace_info
 
+    def _apply_mm_hashes(
+        self, token_ids: np.ndarray, request: "Request"
+    ) -> np.ndarray:
+        """Replace multimodal placeholder tokens with content-dependent
+        hash values so that different images produce different block hashes.
+        """
+        mm_features = getattr(request, "mm_features", None)
+        if not mm_features:
+            return token_ids
+
+        token_ids = token_ids.copy()
+        for feat in mm_features:
+            mm_pos = feat.mm_position
+            start = max(0, mm_pos.offset)
+            end = min(len(token_ids), mm_pos.offset + mm_pos.length)
+            if start >= end:
+                continue
+            token_ids[start:end] = int(feat.identifier, 16) & 0xFFFF
+        return token_ids
+
     def _get_match(
         self,
         request: "Request",
@@ -330,6 +350,7 @@ class FlexKVSchedulerConnector:
             return -1, 0
 
         np_token_ids = np.array(token_ids)
+        np_token_ids = self._apply_mm_hashes(np_token_ids, request)
         np_token_mask = np.ones_like(np_token_ids, dtype=bool)
         np_token_mask[:num_computed_tokens] = False
         namespace = self._extract_namespace(request)
@@ -481,6 +502,7 @@ class FlexKVSchedulerConnector:
             return -1, 0, 0
 
         np_token_ids = np.array(token_ids)
+        np_token_ids = self._apply_mm_hashes(np_token_ids, request)
         namespace = self._extract_namespace(request)
         task_id, unmatched_mask = self.flexkv_manager.put_match(
             token_ids=np_token_ids,
