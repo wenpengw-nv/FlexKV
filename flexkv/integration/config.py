@@ -64,7 +64,15 @@ class FlexKVConfig:
 
         self.model_config.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         self.model_config.head_size = vllm_config.model_config.get_head_size()
-        self.model_config.dtype = vllm_config.model_config.dtype
+        # __FLEXKV_FP8_KVCACHE_PATCH__
+        # vLLM GPU KV cache 实际 dtype 来自 cache_config.cache_dtype (fp8 时 itemsize=1)；
+        # vllm_config.model_config.dtype 是权重 dtype (bf16)，不能直接用，否则 worker
+        # 计算 GPU stride 翻倍 → transfer kernel 越界 → cudaErrorIllegalAddress。
+        _fkv_cache_dtype = getattr(vllm_config.cache_config, "cache_dtype", "auto")
+        if isinstance(_fkv_cache_dtype, str) and _fkv_cache_dtype.lower().startswith("fp8"):
+            self.model_config.dtype = torch.float8_e4m3fn
+        else:
+            self.model_config.dtype = vllm_config.model_config.dtype
         self.model_config.use_mla = vllm_config.model_config.is_deepseek_mla
         self.model_config.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.model_config.dp_size = vllm_config.parallel_config.data_parallel_size
